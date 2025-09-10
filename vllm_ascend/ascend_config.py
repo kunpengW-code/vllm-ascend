@@ -79,6 +79,9 @@ class AscendConfig:
                 raise AssertionError(
                     "oproj_tensor_parallel_size is only supported in pd scenario and can only be used in D node."
                 )
+            self.enable_weight_nz_layout = additional_config.get(
+                "enable_weight_nz_layout", False
+            )  # Whether to convert quantized weights to NZ format to accelerate matrix multiplication
 
 
 class TorchairGraphConfig:

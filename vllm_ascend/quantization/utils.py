@@ -154,6 +154,8 @@ def maybe_auto_detect_quantization(vllm_config) -> None:
     Args:
         vllm_config: A ``vllm.config.VllmConfig`` instance (mutable).
     """
+    if vllm_config.additional_config.get("kv_cache_dtype", "") == "mxfp8":
+        logger.info_once("Enable C8 MXFP8 quantization!")
     model_config = vllm_config.model_config
     model = model_config.model
     revision = model_config.revision

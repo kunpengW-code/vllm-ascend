@@ -32,6 +32,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
+from tests.v1.attention.test_mla_backends import block_size
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
@@ -58,6 +60,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
@@ -95,7 +98,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
+from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState, prune_c8_mxfp_tail_windows
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
 
@@ -112,6 +115,7 @@ from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoa
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
 from vllm_ascend.eplb.eplb_updator import EplbUpdator
 from vllm_ascend.eplb.utils import model_register
+from vllm_ascend.device.mxfp_compat import MXFP8_GROUP_SIZE
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
@@ -136,6 +140,7 @@ from vllm_ascend.utils import (
     enable_sp_by_pass,
     get_c_env,
     global_stream,
+    is_c8_mxfp_kv_quant,
     kv_cache_spec_uses_sparse_c8,
     lmhead_tp_enable,
     set_weight_prefetch_method,
@@ -1877,6 +1882,11 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            if is_c8_mxfp_kv_quant(self.vllm_config):
+                prune_c8_mxfp_tail_windows(
+                    self.compilation_config.static_forward_context,
+                    num_reqs,
+                )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
@@ -3216,11 +3226,29 @@ class NPUModelRunner(GPUModelRunner):
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
 
-    def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
+    def _is_c8_mxfp_kv_cache(
+        self,
+        kv_cache_spec: AttentionSpec,
+    ) -> bool:
+        return isinstance(kv_cache_spec, FullAttentionSpec) and is_c8_mxfp_kv_quant(self.vllm_config)
+
+    def _allocate_raw_cache_tensor(
+        self,
+        size: int | None,
+        alignment: int,
+        *,
+        dtype: torch.dtype = torch.int8,
+    ) -> torch.Tensor | None:
+        if size is None:
+            return None
+        needs_alignment = self.vllm_config.kv_transfer_config is not None
+        if not needs_alignment:
+            return torch.zeros(size, dtype=dtype, device=self.device)
+        tensor = torch.zeros(size + alignment, dtype=dtype, device=self.device)
         data_ptr = tensor.data_ptr()
         aligned_addr = (data_ptr + alignment - 1) // alignment * alignment
         offset = (aligned_addr - data_ptr) // tensor.element_size()
-        return tensor[int(offset) :]
+        return tensor[int(offset):][:size]
 
     def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
@@ -3334,12 +3362,7 @@ class NPUModelRunner(GPUModelRunner):
                     or "cache_only_layers" in layer_name
                 ) and layer_name not in kv_cache_raw_tensors:
                     # for mamba linear attention, attn-linear hybrid, or cache_only_layers (extract_hidden_states)
-                    if self.vllm_config.kv_transfer_config is None:
-                        tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=self.device)
-                    else:
-                        cache_size_aligned = kv_cache_tensor.size + alignment
-                        tensor = torch.zeros(cache_size_aligned, dtype=torch.int8, device=self.device)
-                        tensor = self._align_memory(tensor, alignment)[: kv_cache_tensor.size]
+                    tensor = self._allocate_raw_cache_tensor(kv_cache_tensor.size, alignment, dtype=torch.int8)
 
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the kvcache for all shared layers
@@ -3373,6 +3396,9 @@ class NPUModelRunner(GPUModelRunner):
                             k_tensor_split_factor, v_tensor_split_factor = (
                                 self.vllm_config.quant_config.get_kv_quant_split_factor(layer_name, kv_head_dim_list)
                             )
+                        elif self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
+                            kv_head_dim_list.extend([k_dim // MXFP8_GROUP_SIZE, v_dim // MXFP8_GROUP_SIZE])
+                            k_tensor_split_factor, v_tensor_split_factor, k_tensor_scale_split_factor, v_tensor_scale_split_factor = calc_split_factor(kv_head_dim_list)
                         else:
                             k_tensor_split_factor, v_tensor_split_factor = calc_split_factor(kv_head_dim_list)
 
@@ -3380,54 +3406,32 @@ class NPUModelRunner(GPUModelRunner):
                     v_tensor_size = int(kv_cache_tensor.size // v_tensor_split_factor)
                     dsa_k_tensor_size = None
                     dsa_k_scale_tensor_size = None
+                    k_scale_tensor_size = None
+                    v_scale_tensor_size = None
                     #### for deepseek sparse attention
                     if self.use_sparse:
                         dsa_k_tensor_size = int(kv_cache_tensor.size // dsa_k_tensor_split_factor)
                     if self.use_sparse and current_sparse_c8:
                         dsa_k_scale_tensor_size = int(kv_cache_tensor.size // dsa_k_scale_tensor_split_factor)
+                    if self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
+                        k_scale_tensor_size = int(kv_cache_tensor.size // k_tensor_scale_split_factor)
+                        v_scale_tensor_size = int(kv_cache_tensor.size // v_tensor_scale_split_factor)
 
                     # for other attentions, e.g., self_attn, sliding window attn
-                    if self.vllm_config.kv_transfer_config is None:
-                        k_tensor = torch.zeros(k_tensor_size, dtype=torch.int8, device=self.device)
-                        v_tensor = torch.zeros(v_tensor_size, dtype=torch.int8, device=self.device)
-                        #### for deepseek sparse attention
-                        if dsa_k_tensor_size is not None:
-                            dsa_k_tensor = torch.zeros(dsa_k_tensor_size, dtype=torch.int8, device=self.device)
-                        if dsa_k_scale_tensor_size is not None:
-                            dsa_k_scale_tensor = torch.zeros(
-                                dsa_k_scale_tensor_size, dtype=torch.int8, device=self.device
-                            )
-                    else:
-                        k_tensor = torch.zeros(k_tensor_size + alignment, dtype=torch.int8, device=self.device)
-                        v_tensor = torch.zeros(v_tensor_size + alignment, dtype=torch.int8, device=self.device)
-                        k_tensor = self._align_memory(k_tensor, alignment)[:k_tensor_size]
-                        v_tensor = self._align_memory(v_tensor, alignment)[:v_tensor_size]
-                        #### for deepseek sparse attention
-                        if dsa_k_tensor_size is not None:
-                            dsa_k_tensor = torch.zeros(
-                                dsa_k_tensor_size + alignment, dtype=torch.int8, device=self.device
-                            )
-                            dsa_k_tensor = self._align_memory(dsa_k_tensor, alignment)[:dsa_k_tensor_size]
-                        if dsa_k_scale_tensor_size is not None:
-                            dsa_k_scale_tensor = torch.zeros(
-                                dsa_k_scale_tensor_size + alignment, dtype=torch.int8, device=self.device
-                            )
-                            dsa_k_scale_tensor = self._align_memory(
-                                dsa_k_scale_tensor, alignment
-                            )[:dsa_k_scale_tensor_size]
+                    k_tensor = self._allocate_raw_cache_tensor(k_tensor_size, alignment)
+                    v_tensor = self._allocate_raw_cache_tensor(v_tensor_size, alignment)
+                    # for kv-cache dynamic quantization
+                    k_scale_tensor = self._allocate_raw_cache_tensor(k_scale_tensor_size, alignment)
+                    v_scale_tensor = self._allocate_raw_cache_tensor(v_scale_tensor_size, alignment)
+                    # for deepseek sparse attention
+                    dsa_k_tensor = self._allocate_raw_cache_tensor(dsa_k_tensor_size, alignment)
+                    dsa_k_scale_tensor = self._allocate_raw_cache_tensor(dsa_k_scale_tensor_size, alignment)
 
+                    all_tensor_list = [k_tensor, v_tensor, k_scale_tensor, v_scale_tensor, dsa_k_tensor, dsa_k_scale_tensor]
                     for layer_name_inner in kv_cache_tensor.shared_by:
                         # shared the attn kvcache for all shared layers
                         if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
-                            if self.use_sparse:
-                                if current_sparse_c8:
-                                    kv_cache_raw_tensors[layer_name_inner] = (
-                                        k_tensor, v_tensor, dsa_k_tensor, dsa_k_scale_tensor
-                                    )
-                                else:
-                                    kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor, dsa_k_tensor)
-                            else:
-                                kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor)
+                            kv_cache_raw_tensors[layer_name_inner] = tuple(raw_tensor for raw_tensor in all_tensor_list if raw_tensor is not None)
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
             for layer_name in group.layer_names:
@@ -3511,6 +3515,11 @@ class NPUModelRunner(GPUModelRunner):
                         k_cache = raw_tensor.view(current_kv_cache_spec.dtype).view(kv_cache_shape)
                         kv_caches[layer_name] = k_cache
                         continue  # Skip the rest of the AttentionSpec handling
+                    elif self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
+                        raw_k_tensor, raw_v_tensor, raw_k_scale_tensor, raw_v_scale_tensor = kv_cache_raw_tensors[  # type: ignore
+                            layer_name
+                        ]
+                        sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel() + raw_k_scale_tensor.numel() + raw_v_scale_tensor.numel()
                     else:
                         raw_k_tensor, raw_v_tensor = kv_cache_raw_tensors[  # type: ignore
                             layer_name
@@ -3568,7 +3577,10 @@ class NPUModelRunner(GPUModelRunner):
                             current_kv_cache_spec.num_kv_heads,
                             current_kv_cache_spec.head_size,
                         )
-                    if not isinstance(current_kv_cache_spec, MLAAttentionSpec):
+                    if self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
+                        k_shape = (*kv_cache_shape[1:-1], self.model_config.hf_text_config.head_dim)
+                        v_shape = k_shape
+                    elif not isinstance(current_kv_cache_spec, MLAAttentionSpec):
                         k_shape = kv_cache_shape[1:]
                         if hasattr(current_kv_cache_spec, "head_size_v"):
                             v_shape = (*kv_cache_shape[1:-1], current_kv_cache_spec.head_size_v)
@@ -3626,6 +3638,12 @@ class NPUModelRunner(GPUModelRunner):
                             # dsa_k
                             dsa_k_cache = raw_dsa_k_tensor.view(current_kv_cache_spec.dtype).view(dsa_k_cache_shape)
                             kv_caches[layer_name] = (k_cache, v_cache, dsa_k_cache)
+                    elif self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
+                        k_scale_cache_shape = (k_shape[0], k_shape[2], k_shape[1], k_shape[3] // 64, 2)
+                        v_scale_cache_shape = (v_shape[0], v_shape[2], v_shape[1] // 64, v_shape[3], 2)
+                        k_scale_cache = raw_k_scale_tensor.view(torch.uint8).view(k_scale_cache_shape)
+                        v_scale_cache = raw_v_scale_tensor.view(torch.uint8).view(v_scale_cache_shape)
+                        kv_caches[layer_name] = (k_cache, v_cache, k_scale_cache, v_scale_cache)
                     else:
                         kv_caches[layer_name] = (k_cache, v_cache)
                 elif isinstance(current_kv_cache_spec, MambaSpec):
@@ -3892,7 +3910,17 @@ class NPUModelRunner(GPUModelRunner):
                     continue
 
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
-                    kv_cache_spec[layer_name] = spec
+                    if self._is_c8_mxfp_kv_cache(spec):
+                        block_size = 512
+                        head_size = spec.head_size + spec.head_size // 32
+                        kv_cache_spec[layer_name] = FullAttentionSpec(
+                            block_size=block_size,
+                            num_kv_heads=spec.num_kv_heads,
+                            head_size=head_size,
+                            dtype=torch.float8_e4m3fn,
+                        )
+                    else:
+                        kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)
 
             elif isinstance(attn_module, MLAAttention):

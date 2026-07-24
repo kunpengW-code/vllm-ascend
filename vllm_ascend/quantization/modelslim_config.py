@@ -41,7 +41,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod, VocabParallelEmbedding
 from vllm.model_executor.models.utils import WeightsMapper
 
-from vllm_ascend.utils import ASCEND_QUANTIZATION_METHOD, calc_split_factor
+from vllm_ascend.utils import ASCEND_QUANTIZATION_METHOD, calc_split_factor, is_c8_mxfp_kv_quant
 
 from .methods import get_scheme_class
 
@@ -503,15 +503,16 @@ class AscendModelSlimConfig(QuantizationConfig):
                 return AscendUnquantizedLinearMethod()
             scheme = create_scheme_for_layer(self.quant_description, prefix, "linear", self.packed_modules_mapping)
             return AscendLinearMethod(scheme)
-        elif isinstance(layer, AttentionLayerBase) and (
-            self.is_fa_quant_layer(prefix) or self.is_indexer_quant_layer(prefix)
-        ):
-            scheme = create_scheme_for_layer(self.quant_description, prefix, "attention", self.packed_modules_mapping)
-            return AscendKVCacheMethod(scheme)
-        elif isinstance(layer, AttentionLayerBase) and self.quant_description.get("kv_cache_type") == "C8":
-            from .methods.kv_c8 import AscendC8KVCacheAttentionMethod
-
-            return AscendKVCacheMethod(AscendC8KVCacheAttentionMethod(self.quant_description, prefix))
+        elif isinstance(layer, AttentionLayerBase):
+            if self.is_fa_quant_layer(prefix) or self.is_indexer_quant_layer(prefix):
+                scheme = create_scheme_for_layer(self.quant_description, prefix, "attention", self.packed_modules_mapping)
+                return AscendKVCacheMethod(scheme)
+            elif self.quant_description.get("kv_cache_type") == "C8":
+                from .methods.kv_c8 import AscendC8KVCacheAttentionMethod
+                return AscendKVCacheMethod(AscendC8KVCacheAttentionMethod(self.quant_description, prefix))
+            elif is_c8_mxfp_kv_quant(vllm_config):
+                from .methods.kv_c8 import AscendC8MXFPKVCacheAttentionMethod
+                return AscendKVCacheMethod(AscendC8MXFPKVCacheAttentionMethod(self.quant_description, prefix))
         elif isinstance(layer, FusedMoE):
             if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):
                 # Delayed import to avoid circular import
@@ -579,6 +580,9 @@ class AscendModelSlimConfig(QuantizationConfig):
         return False
 
     def get_kv_quant_dtype(self, layer_name, cache_dtype, model_config):
+        vllm_config = get_current_vllm_config()
+        if is_c8_mxfp_kv_quant(vllm_config):
+            return torch.float8_e4m3fn, torch.float8_e4m3fn
         if self.enable_fa_quant and self.is_fa_quant_layer(layer_name):
             ori_dtype = model_config.dtype
             quant_dtype = torch.int8
